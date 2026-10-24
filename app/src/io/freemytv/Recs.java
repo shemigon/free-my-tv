@@ -36,8 +36,8 @@ import java.util.concurrent.Executors;
 /**
  * Home screen picks ("This morning / afternoon / tonight"): what's trending this week plus recent releases, only from
  * the streaming apps installed on the TV (Netflix, Prime Video, Disney+, Max, Apple TV, Okko, Hulu, Paramount+, Peacock,
- * Globoplay...), via TMDB (an open movie database that knows what streams where in each country). Three per hour.
- * "Watch" opens the service's app.
+ * Globoplay...), via TMDB (an open movie database that knows what streams where in each country). Up to ROW per tab,
+ * in an order the hour turns. "Watch" opens the service's app.
  *
  * Each person uses their own free TMDB key (config.properties "tmdb_key", built into the app). It never goes to the log.
  */
@@ -61,6 +61,8 @@ final class Recs {
     private static final long LIST_EVERY = 6 * 3600_000L;
     /** Bump when what is saved for each title changes (the saved list is discarded and fetched again). */
     private static final int CACHE_VERSION = 4;
+    /** Picks per tab (the home screen shows CardRow.VISIBLE at a time), and titles in the list (movies and shows alternating). */
+    static final int ROW = 10, MAX_PICKS = 30;
     private static final int MANHA = 0, TARDE = 1, NOITE = 2;
     /** Service name on TMDB (part of the name, lowercase) → TV app (HomeApps key, package). */
     private static final String[][] SERVICES = {
@@ -121,12 +123,13 @@ final class Recs {
     private final List<Listener> listeners = new ArrayList<>();
     private final Map<String, Backdrop> images = new LinkedHashMap<>();   // this hour's, built and ready to draw
     private final java.util.Set<String> pending = new java.util.HashSet<>();
+    private final Set<String> kept = new HashSet<>();   // light design: the only images built (keepReady); under images' lock
     private volatile List<Pick> picks = new ArrayList<>();
     private volatile int period = -1;
     private volatile long listAt;
     private volatile boolean fetching;
     private volatile String error = "";
-    private volatile boolean light;     // light design: builds only the cards (all three tabs' cards fit in memory)
+    private volatile boolean light;     // light design: builds only the cards, and only those keepReady keeps
     private volatile long failedAt, keyStamp, linkRetryAt;
     private volatile String listLanguage = "";   // language used for the saved titles, genres and texts
 
@@ -190,7 +193,7 @@ final class Recs {
         return now(null);
     }
 
-    /** This hour's 3, movies only ("movie") or shows only ("tv"); null = both (the home screen tabs). */
+    /** This hour's row (up to ROW), movies only ("movie") or shows only ("tv"); null = both (the home screen tabs). */
     List<Pick> now(String kind) {
         List<Pick> list = new ArrayList<>();
         if (!hasKey(context)) return list;    // no TMDB key: no recommendations
@@ -201,10 +204,10 @@ final class Recs {
         }
         if (list.isEmpty()) return list;
         long hour = System.currentTimeMillis() / 3600_000L;
-        // Three per hour, never two from the same franchise ("Law & Order" and "Law & Order: Special…").
+        // Each hour starts 3 further along; never two from the same franchise ("Law & Order" and "Law & Order: Special…").
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
-        for (int i = 0; i < list.size() && out.size() < 3; i++) {
+        for (int i = 0; i < list.size() && out.size() < ROW; i++) {
             Pick p = list.get((int) ((hour * 3 + i) % list.size()));
             if (seen.add(franchise(p.title))) out.add(p);
         }
@@ -224,23 +227,43 @@ final class Recs {
         return p == null || p.app == null ? "" : SERVICE_NAME.get(p.app);
     }
 
-    /** The pick's ready backdrop (or null: builds it in the background and notifies when it's ready). */
+    /**
+     * The pick's ready backdrop (or null: builds it in the background and notifies when it's ready). In the light design
+     * only the ones keepReady keeps are built.
+     */
     Backdrop backdrop(Pick p) {
         if (p == null || p.backdrop == null) return null;
         final String key = p.backdrop;    // the details may swap the image midway
         synchronized (images) {
             Backdrop b = images.get(key);
             if (b != null) return b;
+            if (light && !kept.contains(key)) return null;
             if (!pending.add(key)) return null;
         }
         io.execute(() -> {
             try {
+                synchronized (images) {
+                    if (light && !kept.contains(key)) return;   // the row moved on while it waited
+                }
                 loadImage(p);
             } finally {
                 synchronized (images) { pending.remove(key); }
             }
         });
         return null;
+    }
+
+    /**
+     * Light design: the cards the home screen shows or may show next. Builds those not ready (in the background) and
+     * lets go of every other, so memory holds only these.
+     */
+    void keepReady(List<Pick> list) {
+        synchronized (images) {
+            kept.clear();
+            for (Pick p : list) if (p.backdrop != null) kept.add(p.backdrop);
+            images.keySet().retainAll(kept);
+        }
+        for (Pick p : list) backdrop(p);
     }
 
     private boolean hasImage(Pick p) {
@@ -370,12 +393,17 @@ final class Recs {
         });
     }
 
-    /** This hour's picks for the three tabs (Explore, Movies, Shows), without repeats. */
+    /** This hour's picks for the three tabs (Explore, Movies, Shows), without repeats: the ones in view first. */
     List<Pick> wanted() {
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
-        for (String kind : new String[] {null, "movie", "tv"}) {
-            for (Pick p : now(kind)) if (seen.add(key(p))) out.add(p);
+        List<List<Pick>> tabs = new ArrayList<>();
+        for (String kind : new String[] {null, "movie", "tv"}) tabs.add(now(kind));
+        for (int pass = 0; pass < 2; pass++) {
+            for (List<Pick> row : tabs) {
+                int from = pass == 0 ? 0 : CardRow.VISIBLE, to = pass == 0 ? Math.min(CardRow.VISIBLE, row.size()) : row.size();
+                for (int i = from; i < to; i++) if (seen.add(key(row.get(i)))) out.add(row.get(i));
+            }
         }
         return out;
     }
@@ -435,11 +463,11 @@ final class Recs {
         List<Pick> newMovies = new ArrayList<>(), newShows = new ArrayList<>();
         for (int i = 0; i < movies.length(); i++) add(newMovies, movies.getJSONObject(i), "movie");
         for (int i = 0; i < shows.length(); i++) add(newShows, shows.getJSONObject(i), "tv");
-        // Trending first, then the new releases; movies and shows alternating, without repeats, up to 24.
+        // Trending first, then the new releases; movies and shows alternating, without repeats.
         List<Pick> list = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
-        alternate(list, seen, hotMovies, hotShows, 24);
-        alternate(list, seen, newMovies, newShows, 24);
+        alternate(list, seen, hotMovies, hotShows, MAX_PICKS);
+        alternate(list, seen, newMovies, newShows, MAX_PICKS);
         if (list.isEmpty()) throw new IOException("TMDB returned no recommendations");
         picks = list;
         period = p;
@@ -710,7 +738,7 @@ final class Recs {
         return key.isEmpty() ? null : key;
     }
 
-    // MARK: - Images (TMDB originals on disk, up to 24 so the whole list fits; this hour's kept ready in memory)
+    // MARK: - Images (TMDB originals on disk, up to MAX_PICKS so the whole list fits; the cards in view kept in memory)
 
     private void download(Pick p) throws IOException {
         File f = imageFile(p);
@@ -757,8 +785,9 @@ final class Recs {
             Backdrop backdrop = Backdrop.make(b, forLight);
             if (forLight != light) return;   // the design changed midway: this one is stale
             synchronized (images) {
+                if (forLight && !kept.contains(p.backdrop)) return;   // scrolled away while it was built
                 images.put(p.backdrop, backdrop);
-                while (images.size() > (forLight ? 10 : 4)) images.remove(images.keySet().iterator().next());
+                while (!forLight && images.size() > 4) images.remove(images.keySet().iterator().next());
             }
             notifyListeners();
         } catch (IOException | RuntimeException | OutOfMemoryError e) {
@@ -769,9 +798,12 @@ final class Recs {
     }
 
     void trim() {
-        // Explore's picks stay: the home screen opens on that tab, so its cards are never gray when you come back.
+        // Explore's cards in view stay: the home screen opens on that tab, so they are never gray when you come back.
         java.util.Set<String> keep = new java.util.HashSet<>();
-        for (Pick p : now(null)) if (p.backdrop != null) keep.add(p.backdrop);
+        List<Pick> explore = now(null);
+        for (int i = 0; i < Math.min(CardRow.VISIBLE, explore.size()); i++) {
+            if (explore.get(i).backdrop != null) keep.add(explore.get(i).backdrop);
+        }
         synchronized (images) {
             images.keySet().retainAll(keep);
         }
@@ -786,9 +818,9 @@ final class Recs {
             if (parts[i].lastModified() < stale) parts[i].delete();
         }
         File[] files = dir.listFiles((d, name) -> !name.endsWith(".part"));
-        if (files == null || files.length <= 24) return;
+        if (files == null || files.length <= MAX_PICKS) return;
         Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-        for (int i = 0; i < files.length - 24; i++) {
+        for (int i = 0; i < files.length - MAX_PICKS; i++) {
             //noinspection ResultOfMethodCallIgnored
             files[i].delete();
         }

@@ -20,9 +20,16 @@ final class Glyphs {
 
     private static final SparseArray<Bitmap> BITMAPS = new SparseArray<>();
     private static final Paint PAINT = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private static final Paint PAIR = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     /** Draws the coin centered at (cx, cy), sized to the text next to it (cap height `cap`), in `color`. */
     static void coin(Context context, Canvas c, String coin, float cx, float cy, float cap, int color) {
+        if (coin.equals("USDT")) {   // the dollar's row: its pair as text
+            String s = HomeData.dollarPair();
+            pair(cap).setColor(color);
+            c.drawText(s, cx - PAIR.measureText(s) / 2, cy + cap / 2, PAIR);
+            return;
+        }
         Bitmap b = bitmap(context, coin, frame(cap));
         if (b == null) return;
         PAINT.setColor(color);
@@ -31,8 +38,16 @@ final class Glyphs {
 
     /** Width the symbol takes up (for laying out the line). */
     static float width(Context context, String coin, float cap) {
+        if (coin.equals("USDT")) return pair(cap).measureText(HomeData.dollarPair());
         Bitmap b = bitmap(context, coin, frame(cap));
         return b == null ? 0 : b.getWidth();
+    }
+
+    /** The pair's text at the cap height next to it. */
+    private static Paint pair(float cap) {
+        PAIR.setTypeface(Ui.medium);
+        PAIR.setTextSize(cap * 1.4f);
+        return PAIR;
     }
 
     /** Side of the 32-unit frame: the largest symbol (the ETH diamond) ends up ~1.3 × the cap height. */

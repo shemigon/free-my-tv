@@ -52,7 +52,8 @@ before you do it, and let them do the taps on the TV.
 7. **Tell them what the switch does** before they make it: the home screen and screensaver change, a short list of
    promo apps is turned off (never uninstalled), and *Original* brings it all back. On TCL, the remote's Netflix,
    YouTube and Prime buttons keep working through a small accessibility service that only reads those buttons
-   (*Free My TV* → *Remote Buttons* picks what each opens); *Original* turns it off. On Xiaomi TVs whose remote has no
+   (*Free My TV* → *Remote Buttons* picks what each opens), and which app is in front for the TV power options
+   (*Home Settings*); *Original* turns it off. On Xiaomi TVs whose remote has no
    Home button, the same service makes its Mi button open Free My TV instead of PatchWall.
 8. **They switch on the TV:** *Free My TV* → *Home Screen* → *Free My TV*. The app uses the TV's own ADB on
    127.0.0.1 with its own key, so the TV asks once more to allow debugging. Don't switch modes from the computer.
@@ -237,6 +238,25 @@ entries; its system pieces are in `PROTECTED`. USB debugging opens ADB on 5555 t
   (`com.xiaomi.android.tvsetup.partnercustomizer`, its log: "dealWithHotkey keycode:199"). "Xiaomi default" (empty)
   leaves the key to the TV.
   `adb shell input keyevent` doesn't test any of these: injected keys skip the accessibility key filter.
+- On TCL, the same service hosts `TvPower` (its own thread; Home Settings' TV power rows, saved in `remote-keys.txt`
+  by name; what `:keys` itself writes is in `tv-power-state.txt`). HDMI devices going to standby send only Inactive
+  Source, which TCL ignores but logs (`HdmiCecController`): `TvPower` follows that log (`Adb.follow`, a long-lived
+  `logcat` from `:keys`, retried up to every 2 min) and turns the TV off 1 s from there. A PS5 sends it when rest starts, ~70 s
+  before its picture stops; a PS5 the TV woke (by switching to its input) sends no Active or Inactive Source at all.
+  The port's `TvInputManager` state (CONNECTED / CONNECTED_STANDBY) is the fallback, but an Apple TV's port stays
+  CONNECTED while it sleeps. TCL switches to a device 11 ms after its Active Source, so "what was showing" comes from
+  before it: the service's window events (package names only) and TCL's `createSessionInternalLocked` log lines.
+  Going back: a device that switched the TV over from an app or the home screen goes back there at standby (from
+  another input: the home screen); `com.tcl.sourcemananger`, TCL's input switcher, isn't an app (only a phone
+  launcher). A device that woke the TV gets no going back.
+  TCL's standby chip eats a device's CEC wake and the TV comes back on its last input; `STR_Worker` logs why it woke
+  (`wakeup reason = 4` CEC, `3` remote). Any app can log under any tag, so `TvLog` reads `-v <clock>,uid` and keeps
+  only system (1000; the stream prints numbers) and root lines (`rtkd`; the one-shot read prints `root`). A long
+  `logcat`'s `-v monotonic` stamps go wrong after the TV sleeps, so the stream reads `-v epoch`, turned into uptime as
+  each line arrives; the one-shot `logcat -d -v monotonic` is right. The current input is `persist.sys.curInput`; an
+  input opens with VIEW `TvContract.buildChannelUriForPassthroughInput`; `input keyevent KEYCODE_SLEEP` turns the TV
+  off. The shell goes through `Adb.connectKnown`, which never offers the key (no prompt from a background process).
+  Tested on a TCL BeyondTV2 (Realtek, Android TV 9).
 - HY300 projectors (Hotack, Allwinner H713, Android 11 tested; the build claims to be an `askey`/`adt3`): the stock
   home screen and screensaver are `com.htc.htclauncherhighenglishd08`, which also carries an ad SDK (`com.zeasn.ad`).
   Keystone, zoom and projection mode live in `com.htc.htcsettings` (`action.htcsettings.prjsettings`), and the Miracast
@@ -281,5 +301,6 @@ entries; its system pieces are in `PROTECTED`. USB debugging opens ADB on 5555 t
 - Never commit `config.properties`, `*.keystore` or any key.
 - Never uninstall or clear the data of system apps; only `pm disable-user --user 0`, through `HomeMode`, so
   *Original* can bring it back.
-- Don't change the TV's picture, sound, network or account settings.
+- Don't change the TV's picture, sound, network or account settings. One exception, the person's own choice: TCL's
+  *Volume when turned on* (`TvPower`, off by default).
 - Keep the way back working: the *Original* mode and the watchdog.

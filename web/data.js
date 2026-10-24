@@ -1,7 +1,7 @@
 /*
  * What the home screen shows, kept in localStorage so it opens with numbers:
  *  - the picks: what's trending this week and recent releases, only from the streaming apps on this TV (TMDB, with
- *    the person's own free key from config.properties), three per hour;
+ *    the person's own free key from config.properties), up to ROW per tab in an order the hour turns;
  *  - weather, sunrise and sunset (Open-Meteo, every 30 min) and optional crypto prices (Binance, every 5 min).
  * Settings changed on the TV (Prefs) win over config.properties, as on Android. Built without a city (--generic), the
  * TV's time zone gives the city, and its country the currency and the region (zones.js).
@@ -46,6 +46,7 @@ var Prefs = (function () {
     language: function () { return pick('language', CONFIG.language || 'auto'); },
     temperature: function () { return pick('temperature', CONFIG.temperature || 'auto'); },
     theme: function () { return pick('theme', 'auto'); },
+    clock: function () { var c = pick('clock', 'auto'); return c === '12' || c === '24' ? c : 'auto'; },
     weather: function () { return pick('weather', true); },
     quotes: function () { return pick('quotes', CONFIG.showCrypto !== false); },
     coin: function (i) { var c = pick('coins', null); return c ? c[i] !== false : true; },
@@ -154,11 +155,17 @@ var Data = (function () {
   }
   var prices = [NaN, NaN, NaN, NaN], changes = [NaN, NaN, NaN, NaN], pricesAt = 0, fetchingPrices = false;
 
-  /** Indexes in COINS of the coins that are on (the dollar only in Brazilian reais, where Binance lists it). */
+  /** The dollar's row: USDTBRL in reais; in euros Binance has only EURUSDT, so the dollar is its inverse. */
+  function dollarRow() { return CURRENCY === 'BRL' || CURRENCY === 'EUR'; }
+  function dollarPair() { return (CURRENCY === 'BRL' ? 'R$' : '€') + '/$'; }
+  function inverted(k) { return k === 3 && QUOTE === 'EUR'; }
+  function pair(k) { return inverted(k) ? 'EURUSDT' : COINS[k] + QUOTE; }
+
+  /** Indexes in COINS of the coins that are on (the dollar only where Binance lists it). */
   function activeCoins() {
     var out = [];
     if (!Prefs.quotes()) return out;
-    for (var i = 0; i < COINS.length; i++) if (Prefs.coin(i) && (i < 3 || CURRENCY === 'BRL')) out.push(i);
+    for (var i = 0; i < COINS.length; i++) if (Prefs.coin(i) && (i < 3 || dollarRow())) out.push(i);
     return out;
   }
 
@@ -166,9 +173,10 @@ var Data = (function () {
     var found = 0;
     for (var i = 0; list && i < list.length; i++) {
       for (var k = 0; k < COINS.length; k++) {
-        if (list[i].symbol !== COINS[k] + QUOTE) continue;
+        if (list[i].symbol !== pair(k)) continue;
         found++;
         var last = parseFloat(list[i].lastPrice), open = parseFloat(list[i].openPrice);
+        if (inverted(k)) { last = 1 / last; open = 1 / open; }
         prices[k] = last;
         changes[k] = open > 0 ? (last - open) / open * 100 : NaN;
       }
@@ -185,7 +193,7 @@ var Data = (function () {
     var coins = activeCoins(), now = Date.now();
     if (!coins.length || fetchingPrices || (now - pricesAt < 5 * 60000 && now >= pricesAt)) return;
     fetchingPrices = true;
-    var symbols = coins.map(function (i) { return '%22' + COINS[i] + QUOTE + '%22'; }).join(',');
+    var symbols = coins.map(function (i) { return '%22' + pair(i) + '%22'; }).join(',');
     var path = '/api/v3/ticker/24hr?type=MINI&symbols=%5B' + symbols + '%5D';
     // Binance.com refuses the US (HTTP 451); Binance.US answers the same call in dollars.
     var hosts = ['https://api.binance.com', 'https://api.binance.us'];
@@ -282,7 +290,10 @@ var Data = (function () {
     return (cut > 0 ? t.slice(0, cut) : t).replace(/^\s+|\s+$/g, '');
   }
 
-  /** This hour's 3 picks: movies ("movie"), shows ("tv") or both (null). */
+  /** Picks per tab (three in view, the rest with →), and titles in the list (movies and shows alternating). */
+  var ROW = 10, MAX_PICKS = 30, VISIBLE = 3;
+
+  /** This hour's row (up to ROW): movies ("movie"), shows ("tv") or both (null). */
   function now(kind) {
     var list = [];
     if (!KEY) return list;
@@ -292,7 +303,7 @@ var Data = (function () {
     }
     if (!list.length) return list;
     var hour = Math.floor(Date.now() / 3600000), out = [], seen = {};
-    for (var j = 0; j < list.length && out.length < 3; j++) {
+    for (var j = 0; j < list.length && out.length < ROW; j++) {
       var q = list[(hour * 3 + j) % list.length], f = franchise(q.title);
       if (!seen[f]) { seen[f] = true; out.push(q); }
     }
@@ -446,8 +457,8 @@ var Data = (function () {
           tmdb('/discover/tv?vote_count.gte=20&air_date.gte=' + day(-90) + '&air_date.lte=' + day(0) + common, function (e2, r2) {
             for (var k = 0; !e2 && k < r2.results.length; k++) addPick(fresh.tv, r2.results[k], 'tv');
             var list = [], seen = {};
-            alternate(list, seen, hot.movie, hot.tv, 24);
-            alternate(list, seen, fresh.movie, fresh.tv, 24);
+            alternate(list, seen, hot.movie, hot.tv, MAX_PICKS);
+            alternate(list, seen, fresh.movie, fresh.tv, MAX_PICKS);
             if (!list.length) { done(new Error('TMDB returned no recommendations')); return; }
             picks = list;
             done(null);
@@ -491,12 +502,16 @@ var Data = (function () {
     }
   }
 
-  /** This hour's picks for the three tabs, without repeats (the screensaver shows them too). */
+  /** This hour's picks for the three tabs, without repeats, the ones in view first (the screensaver shows them too). */
   function all() {
-    var out = [], seen = {}, kinds = [null, 'movie', 'tv'];
-    for (var k = 0; k < kinds.length; k++) {
-      var list = now(kinds[k]);
-      for (var i = 0; i < list.length; i++) if (!seen[keyOf(list[i])]) { seen[keyOf(list[i])] = true; out.push(list[i]); }
+    var out = [], seen = {}, rows = [now(null), now('movie'), now('tv')];
+    for (var pass = 0; pass < 2; pass++) {
+      for (var k = 0; k < rows.length; k++) {
+        var list = rows[k], to = pass === 0 ? Math.min(VISIBLE, list.length) : list.length;
+        for (var i = pass === 0 ? 0 : VISIBLE; i < to; i++) {
+          if (!seen[keyOf(list[i])]) { seen[keyOf(list[i])] = true; out.push(list[i]); }
+        }
+      }
     }
     return out;
   }
@@ -513,6 +528,8 @@ var Data = (function () {
     COINS: COINS,
     city: Place.city,
     currency: CURRENCY,
+    dollarRow: dollarRow,
+    dollarPair: dollarPair,
     onChange: function (fn) { listeners.push(fn); },
     setApps: function (apps) { installed = apps; },
     appFor: appFor,
@@ -526,6 +543,7 @@ var Data = (function () {
     activeCoins: activeCoins,
     hasKey: function () { return !!KEY; },
     recsError: function () { return recsError; },
+    VISIBLE: VISIBLE,
     picks: now,
     showcase: all,
     image: function (path, size) { return path ? 'https://image.tmdb.org/t/p/' + (size || 'w1280') + path : ''; },

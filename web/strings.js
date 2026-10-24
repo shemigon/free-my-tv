@@ -90,7 +90,7 @@ var I18N = (function () {
   function formatDate(key, at) {
     var minute = Math.floor(at / 60000), last = formatted[key];
     if (last && last.minute === minute && last.lang === lang) return last.text;   // the clocks ask every second
-    var d = new Date(at), out = format(tr(key), d, locale);
+    var d = new Date(at), out = format(withClock(key, tr(key)), d, locale);
     if (out === null) out = format(key.substring(key.indexOf('|') + 1), d, 'en-US');
     formatted[key] = {minute: minute, lang: lang, text: out};
     return out;
@@ -98,6 +98,34 @@ var I18N = (function () {
 
   /** The last text of each "format|..." key, by minute (the catalogues' patterns go down to minutes). */
   var formatted = {};
+  var clock = 'auto';
+
+  /**
+   * A time pattern in the hours picked (Home Settings, Clock): 24 turns "h:mm a" into "H:mm"; 12 takes the English
+   * pattern where the language has a 24-hour one. As Ui.withClock on Android.
+   */
+  function withClock(key, pattern) {
+    if (clock === '12') return unquoted(pattern, 'H') ? key.substring(key.indexOf('|') + 1) : pattern;
+    if (clock !== '24' || !unquoted(pattern, 'h') && !unquoted(pattern, 'K')) return pattern;
+    var out = '', quoted = false;
+    for (var i = 0; i < pattern.length; i++) {
+      var ch = pattern.charAt(i);
+      if (ch === "'") quoted = !quoted;
+      if (quoted || ch !== 'a') out += !quoted && (ch === 'h' || ch === 'K') ? 'H' : ch;
+    }
+    out = out.replace(/^\s+|\s+$/g, '').replace(/\s{2,}/g, ' ');
+    return out === 'H' ? 'HH:mm' : out;   // the forecast's "2 PM": "14:00", as most languages have it
+  }
+
+  function unquoted(pattern, letter) {
+    var quoted = false;
+    for (var i = 0; i < pattern.length; i++) {
+      var ch = pattern.charAt(i);
+      if (ch === "'") quoted = !quoted;
+      else if (!quoted && ch === letter) return true;
+    }
+    return false;
+  }
 
   function format(pattern, d, loc) {
     var out = '', i = 0;
@@ -249,6 +277,8 @@ var I18N = (function () {
     get base() { return base(lang); },
     /** BCP 47 tag for dates, numbers and TMDB. */
     locale: function () { return locale; },
+    /** "auto", "12" or "24" (Home Settings). */
+    setClock: function (mode) { clock = mode; formatted = {}; },
     languages: languages,
     languageName: languageName,
     tr: tr,

@@ -56,7 +56,7 @@ final class HomeData {
     private static final long PRICES_EVERY = 5 * 60_000L, WEATHER_EVERY = 30 * 60_000L;
     interface Listener { void onData(); }
 
-    /** BTC, ETH and SOL; in Brazilian reais also the dollar (USDT/BRL), which Binance doesn't list for most currencies. */
+    /** BTC, ETH and SOL; in reais and euros also the dollar, which Binance doesn't list for most currencies. */
     static int coinCount() {
         return Prefs.quotes() ? active().length : 0;
     }
@@ -72,8 +72,8 @@ final class HomeData {
         if (a != null && activeVersion == Prefs.version && activeInDollars == dollars) return a;
         int n = 0;
         int[] tmp = new int[COINS.length];
-        // The dollar only in reais, not in dollars: USDTUSDT isn't a pair, and Binance would refuse the whole request.
-        for (int i = 0; i < COINS.length; i++) if (Prefs.coin(i) && (i < 3 || CURRENCY.equals("BRL") && !dollars)) tmp[n++] = i;
+        // The dollar only where it has a pair, not in dollars: USDTUSDT isn't one, and Binance would refuse the whole request.
+        for (int i = 0; i < COINS.length; i++) if (Prefs.coin(i) && (i < 3 || dollarRow() && !dollars)) tmp[n++] = i;
         a = java.util.Arrays.copyOf(tmp, n);
         activeCoins = a;
         activeVersion = Prefs.version;
@@ -89,6 +89,25 @@ final class HomeData {
         weatherFailedAt = 0;
     }
 
+    /** The dollar's row: USDTBRL in reais; in euros Binance has only EURUSDT, so the dollar is its inverse. */
+    static boolean dollarRow() {
+        return CURRENCY.equals("BRL") || CURRENCY.equals("EUR");
+    }
+
+    /** What the dollar's row shows in place of a logo: "€/$", "R$/$" (it is the dollar's price, not Tether's). */
+    static String dollarPair() {
+        return (CURRENCY.equals("BRL") ? "R$" : "€") + "/$";
+    }
+
+    /** Binance's pair for a coin; inverted() says when its price is the other way round. */
+    private static String pair(int coin) {
+        return inverted(coin) ? "EURUSDT" : COINS[coin] + quote();
+    }
+
+    private static boolean inverted(int coin) {
+        return coin == 3 && quote().equals("EUR");
+    }
+
     static String coinName(int i) {
         return i == 3 ? Ui.tr("Dollar") : COIN_NAMES[i];
     }
@@ -99,7 +118,7 @@ final class HomeData {
     private static String pricesPath() {
         StringBuilder symbols = new StringBuilder();
         int[] coins = active();
-        for (int i = 0; i < coins.length; i++) symbols.append(i == 0 ? "" : ",").append("%22").append(COINS[coins[i]]).append(quote()).append("%22");
+        for (int i = 0; i < coins.length; i++) symbols.append(i == 0 ? "" : ",").append("%22").append(pair(coins[i])).append("%22");
         return "/api/v3/ticker/24hr?type=MINI&symbols=%5B" + symbols + "%5D";
     }
 
@@ -237,16 +256,19 @@ final class HomeData {
 
     private void parsePrices(String body) throws Exception {
         JSONArray list = new JSONArray(body);
-        String quote = quote();
         int found = 0;
         for (int i = 0; i < list.length(); i++) {
             JSONObject o = list.getJSONObject(i);
             String symbol = o.getString("symbol");
             for (int k = 0; k < COINS.length; k++) {
-                if (!symbol.equals(COINS[k] + quote)) continue;
+                if (!symbol.equals(pair(k))) continue;
                 found++;
                 double last = Double.parseDouble(o.optString("lastPrice", o.optString("price", "NaN")));
                 double open = Double.parseDouble(o.optString("openPrice", "NaN"));
+                if (inverted(k)) {
+                    last = 1 / last;
+                    open = 1 / open;
+                }
                 prices[k] = last;
                 changes[k] = open > 0 ? (last - open) / open * 100 : Double.NaN;
             }

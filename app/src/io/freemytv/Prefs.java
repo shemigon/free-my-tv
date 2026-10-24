@@ -11,8 +11,12 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Settings changed on the TV itself (Free My TV > Settings). config.properties only gives the first
@@ -76,10 +80,10 @@ final class Prefs {
      */
     @SuppressWarnings("deprecation")
     static void reload() {
-        String before = language();
+        String before = language(), clockBefore = clock();
         app.getSharedPreferences("settings", Context.MODE_MULTI_PROCESS);
         version++;
-        if (!language().equals(before)) Ui.applyLanguage();
+        if (!language().equals(before) || !clock().equals(clockBefore)) Ui.applyLanguage();
     }
 
     private static void put(String key, String value) {
@@ -118,6 +122,14 @@ final class Prefs {
     }
 
     static void setTheme(String v) { put("theme", v); }
+
+    /** "auto" (the language's), "12" or "24": hours on the clock, the sun times and the hourly forecast. */
+    static String clock() {
+        String v = app == null ? "auto" : sp().getString("clock", "auto");
+        return v.equals("12") || v.equals("24") ? v : "auto";
+    }
+
+    static void setClock(String v) { put("clock", v); Ui.applyLanguage(); }
 
     // MARK: - City
 
@@ -200,70 +212,156 @@ final class Prefs {
     }
 
     // The key service runs in its own small process (:keys), so that a busy home screen can never delay the TV's keys.
-    // SharedPreferences are not shared between processes, so these few values live in a tiny file both processes read.
+    // SharedPreferences are not shared between processes, so what it reads lives in a tiny file of name=value lines
+    // (remote buttons by key code, the TV power options by name), written only by the settings screen's process.
     // The service asks on every key: the values stay in memory and the file is read again only when it changes.
-    private static File keysFile() {
+    private static File sharedFile() {
         return new File(app.getFilesDir(), "remote-keys.txt");
     }
 
-    private static final String[] keyApps = new String[KEYS.length];   // null = the default
-    private static long keysStamp = Long.MIN_VALUE;
+    private static final Map<String, String> shared = new LinkedHashMap<>();   // every line, unknown names kept
+    private static long sharedStamp = Long.MIN_VALUE;
+    private static boolean writePending;   // a write is queued: the file is older than the map
+    private static final ExecutorService writer = Executors.newSingleThreadExecutor();
 
-    /** A temporary file per process (two can start together after an update), synced before it replaces the old one. */
-    private static boolean writeKeys(String text) {
-        File tmp = new File(app.getFilesDir(), "remote-keys." + android.os.Process.myPid() + ".tmp");
+    /** Reads name=value lines; a missing file is empty, an unreadable one null (not taken for defaults). */
+    static Map<String, String> readLines(File f) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (!f.exists()) return out;
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                int eq = line.indexOf('=');
+                if (eq > 0) out.put(line.substring(0, eq), line.substring(eq + 1));
+            }
+        } catch (IOException e) {
+            AppLog.w("couldn't read " + f.getName() + ": " + e.getMessage());
+            return null;
+        }
+        return out;
+    }
+
+    /**
+     * Writes name=value lines through a temporary file per process (two can start together after an update), synced
+     * before it replaces the old one.
+     */
+    static boolean writeLines(File f, Map<String, String> values) {
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> e : values.entrySet()) sb.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+        File tmp = new File(f.getParentFile(), f.getName() + "." + android.os.Process.myPid() + ".tmp");
         try (FileOutputStream out = new FileOutputStream(tmp)) {
-            out.write(text.getBytes(StandardCharsets.UTF_8));
+            out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
             out.getFD().sync();
         } catch (IOException e) {
             //noinspection ResultOfMethodCallIgnored
             tmp.delete();
+            AppLog.w("couldn't write " + f.getName() + ": " + e.getMessage());
             return false;
         }
-        return tmp.renameTo(keysFile());
+        if (tmp.renameTo(f)) return true;
+        //noinspection ResultOfMethodCallIgnored
+        tmp.delete();
+        AppLog.w("couldn't replace " + f.getName());
+        return false;
     }
 
     /** Choices saved before they moved to the file (in SharedPreferences) are copied there once. */
     private static void migrateKeys() {
-        if (keysFile().exists()) return;
+        if (sharedFile().exists()) return;
         SharedPreferences old = sp();
-        boolean any = false;
-        for (int key : KEYS) any |= old.contains("key" + key);
-        if (!any) return;
-        StringBuilder sb = new StringBuilder();
-        for (int key : KEYS) sb.append(key).append('=').append(old.getString("key" + key, defaultApp(key))).append('\n');
-        writeKeys(sb.toString());
+        Map<String, String> values = new LinkedHashMap<>();
+        for (int key : KEYS) if (old.contains("key" + key)) values.put(String.valueOf(key), old.getString("key" + key, defaultApp(key)));
+        if (!values.isEmpty()) writeLines(sharedFile(), values);
+    }
+
+    private static long stamp(File f) {
+        return f.lastModified() * 31 + f.length();   // 0 without the file: everything takes its default
+    }
+
+    /** Reads the file again when it changed (fresh: whatever its stamp says), outside the lock: keys wait on it. */
+    private static void refreshShared(boolean fresh) {
+        File f = sharedFile();
+        long stamp = stamp(f);
+        synchronized (shared) {
+            // While our own write is queued the map is newer than the file: reading the file would lose the change.
+            if (writePending || !fresh && stamp == sharedStamp) return;
+        }
+        Map<String, String> lines = readLines(f);
+        if (lines == null) return;   // unreadable: what was read before stays
+        synchronized (shared) {
+            if (writePending) return;
+            sharedStamp = stamp;
+            shared.clear();
+            shared.putAll(lines);
+        }
+    }
+
+    /** Saves in the background (a held arrow doesn't sync the file per step); the latest values win. */
+    private static void putShared(String name, String value) {
+        refreshShared(false);   // the file's current lines, so none is dropped
+        synchronized (shared) {
+            shared.put(name, value);
+            version++;
+            scheduleWrite();
+        }
+    }
+
+    /** Called with the lock held. */
+    private static void scheduleWrite() {
+        if (writePending) return;   // the queued write takes this change too
+        writePending = true;
+        writer.execute(() -> {
+            Map<String, String> values;
+            synchronized (shared) {
+                values = new LinkedHashMap<>(shared);
+            }
+            boolean ok = writeLines(sharedFile(), values);
+            synchronized (shared) {
+                writePending = false;
+                // Failed: the next read shows what the file really holds, rather than a change :keys never got.
+                sharedStamp = ok ? stamp(sharedFile()) : Long.MIN_VALUE;
+                if (ok && !values.equals(shared)) scheduleWrite();   // changed while the file was being written
+            }
+        });
     }
 
     /** Package the key opens ("" = nothing). */
     static String keyApp(int keyCode) {
-        synchronized (keyApps) {
-            File f = keysFile();
-            long stamp = f.lastModified() * 31 + f.length();   // 0 without the file: every key opens its default
-            if (stamp != keysStamp) {
-                keysStamp = stamp;
-                java.util.Arrays.fill(keyApps, null);
-                if (stamp != 0) {
-                    try (BufferedReader r = new BufferedReader(new FileReader(f))) {
-                        String line;
-                        while ((line = r.readLine()) != null) {
-                            for (int i = 0; i < KEYS.length; i++) {
-                                String prefix = KEYS[i] + "=";
-                                if (line.startsWith(prefix)) keyApps[i] = line.substring(prefix.length());
-                            }
-                        }
-                    } catch (IOException ignored) {
-                    }
-                }
-            }
-            for (int i = 0; i < KEYS.length; i++) if (KEYS[i] == keyCode && keyApps[i] != null) return keyApps[i];
-            return defaultApp(keyCode);
+        String v = sharedOr(String.valueOf(keyCode), null);
+        return v != null ? v : defaultApp(keyCode);
+    }
+
+    static void setKeyApp(int keyCode, String pkg) { putShared(String.valueOf(keyCode), pkg); }
+
+    // MARK: - TV power (TCL, Free My TV mode; read by TvPower in :keys)
+
+    /** Re-reads the file, whatever its stamp says: TvPower calls it before each decision (15 -> 16 keeps the size). */
+    static void reloadShared() { refreshShared(true); }
+
+    private static String sharedOr(String name, String fallback) {
+        refreshShared(false);
+        synchronized (shared) {
+            String v = shared.get(name);
+            return v != null ? v : fallback;
         }
     }
 
-    static void setKeyApp(int keyCode, String pkg) {
-        StringBuilder sb = new StringBuilder();
-        for (int key : KEYS) sb.append(key).append('=').append(key == keyCode ? pkg : keyApp(key)).append('\n');
-        if (writeKeys(sb.toString())) version++;
+    /** The TV turns off when the HDMI device it shows goes to standby. */
+    static boolean offWithDevice() { return !"0".equals(sharedOr("off_with_device", "1")); }
+    static void setOffWithDevice(boolean on) { putShared("off_with_device", on ? "1" : "0"); }
+
+    /** On turning on: the waking device's input, or the home screen when the remote woke it. Off: the TV's own choice. */
+    static boolean turnOnScreen() { return !"0".equals(sharedOr("turn_on_screen", "1")); }
+    static void setTurnOnScreen(boolean on) { putShared("turn_on_screen", on ? "1" : "0"); }
+
+    /** Volume set every time the TV turns on, 1 to 100; 0 leaves it alone. */
+    static int startVolume() {
+        try {
+            return Math.max(0, Math.min(100, Integer.parseInt(sharedOr("start_volume", "0"))));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
+
+    static void setStartVolume(int v) { putShared("start_volume", String.valueOf(Math.max(0, Math.min(100, v)))); }
 }

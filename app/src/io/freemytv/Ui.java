@@ -224,7 +224,11 @@ final class Ui {
         locale = localeOf(lang);
         plurals = PluralRules.forLocale(locale);
         language = lang;
+        clock = Prefs.clock();
         DATE_PATTERNS.clear();
+        synchronized (FORMATTED) {
+            FORMATTED.clear();   // keyed by language, not by the clock
+        }
         generation++;
     }
 
@@ -404,7 +408,7 @@ final class Ui {
     static synchronized DatePattern datePattern(String key) {
         DatePattern pattern = DATE_PATTERNS.get(key);
         if (pattern == null) {
-            String text = tr(key);
+            String text = withClock(key, tr(key), clock);
             Locale loc = locale();
             try {
                 new SimpleDateFormat(text, loc);
@@ -417,6 +421,35 @@ final class Ui {
             DATE_PATTERNS.put(key, pattern);
         }
         return pattern;
+    }
+
+    private static String clock = "auto";
+
+    /**
+     * A time pattern in the hours picked (Home Settings → Clock): 24 turns "h:mm a" into "H:mm"; 12 takes the English
+     * pattern where the language has a 24-hour one. "auto" and patterns without hours stay as they are. web/strings.js
+     * does the same.
+     */
+    static String withClock(String key, String text, String clock) {
+        if (clock.equals("12")) return unquoted(text, 'H') ? key.substring("format|".length()) : text;
+        if (!clock.equals("24") || !unquoted(text, 'h') && !unquoted(text, 'K')) return text;
+        StringBuilder out = new StringBuilder();
+        boolean quoted = false;
+        for (char ch : text.toCharArray()) {
+            if (ch == '\'') quoted = !quoted;
+            if (quoted || ch != 'a') out.append(!quoted && (ch == 'h' || ch == 'K') ? 'H' : ch);
+        }
+        String hours = out.toString().trim().replaceAll("\\s{2,}", " ");
+        return hours.equals("H") ? "HH:mm" : hours;   // the forecast's "2 PM": "14:00", as most languages have it
+    }
+
+    private static boolean unquoted(String text, char letter) {
+        boolean quoted = false;
+        for (char ch : text.toCharArray()) {
+            if (ch == '\'') quoted = !quoted;
+            else if (!quoted && ch == letter) return true;
+        }
+        return false;
     }
 
     static final class DatePattern {

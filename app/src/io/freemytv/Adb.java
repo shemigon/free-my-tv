@@ -36,8 +36,8 @@ import javax.crypto.Cipher;
 /**
  * ADB client that talks to the TV itself (127.0.0.1:5555, open while debugging is on). It's what lets the app switch
  * the home screen and the screensaver, and turn off apps, without a computer. The first time, the TV asks
- * "Allow USB debugging?" and you accept with "Always allow". Only HomeMode uses it, and only with its own fixed
- * commands (nothing from outside).
+ * "Allow USB debugging?" and you accept with "Always allow". Only HomeMode and TvPower use it, and only with their own
+ * fixed commands; the one value from outside is TvPower's current input id, read from the TV and single-quoted.
  * Protocol: https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/protocol.txt
  */
 final class Adb implements Closeable {
@@ -138,6 +138,18 @@ final class Adb implements Closeable {
         }
     }
 
+    /**
+     * Signs in with the key the TV already accepted: never offers it (no prompt on the screen) and never makes a new one,
+     * which stays the main process's job. For TvPower, in the :keys process.
+     */
+    static Adb connectKnown(Context c) throws IOException {
+        KeyPair keys = storedKeys(c);
+        if (keys == null) throw new IOException("no ADB key yet");
+        Adb adb = signedIn(keys);
+        if (adb == null) throw new IOException("the TV's ADB refused or didn't answer");
+        return adb;
+    }
+
     /** A new connection that only signs (it never offers the key, so no second prompt); null while the TV doesn't know it. */
     private static Adb signedIn(KeyPair keys) {
         Socket s = new Socket();
@@ -163,22 +175,52 @@ final class Adb implements Closeable {
 
     /** Runs a command in the TV's shell and returns its output (stdout and stderr together). */
     String shell(String command) throws IOException {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        run(command, result::write);
+        return result.toString("UTF-8");
+    }
+
+    interface LineSink { void line(String line); }
+
+    private static final int MAX_LINE = 8192;
+
+    /**
+     * Runs a command that keeps printing (logcat without -d) and hands over each line as it comes, until the command
+     * ends or close() is called from another thread. A quiet command isn't a dead one: no read timeout here.
+     */
+    void follow(String command, LineSink sink) throws IOException {
+        socket.setSoTimeout(0);
+        ByteArrayOutputStream line = new ByteArrayOutputStream();
+        run(command, data -> {
+            for (byte b : data) {
+                if (b != '\n') {
+                    if (line.size() < MAX_LINE) line.write(b);   // the rest of a longer line is dropped
+                    continue;
+                }
+                sink.line(new String(line.toByteArray(), StandardCharsets.UTF_8));
+                line.reset();
+            }
+        });
+    }
+
+    private interface Chunks { void write(byte[] data) throws IOException; }
+
+    private void run(String command, Chunks chunks) throws IOException {
         int local = nextLocalId++;
         send(OPEN, local, 0, ("shell:" + command + "\0").getBytes(StandardCharsets.UTF_8));
         int remote = 0;
-        ByteArrayOutputStream result = new ByteArrayOutputStream();
         while (true) {
             Message m = read();
             if (m.arg1 != local) continue;
             if (m.command == OKAY) {
                 remote = m.arg0;
             } else if (m.command == WRTE) {
-                result.write(m.data);
+                chunks.write(m.data);
                 send(OKAY, local, m.arg0, null);
             } else if (m.command == CLSE) {
                 if (remote == 0 && m.arg0 == 0) throw new IOException(Ui.tr("ADB refused the command"));
                 send(CLSE, local, m.arg0, null);
-                return result.toString("UTF-8");
+                return;
             }
         }
     }
@@ -219,19 +261,12 @@ final class Adb implements Closeable {
     // MARK: - The app's key (kept in private storage; never goes to the log)
 
     private static synchronized KeyPair keys(Context c) throws IOException {
+        KeyPair stored = storedKeys(c);
+        if (stored != null) return stored;
         File dir = c.getFilesDir();
         File privateFile = new File(dir, "adbkey"), publicFile = new File(dir, "adbkey.pub");
         try {
-            KeyFactory factory = KeyFactory.getInstance("RSA");
-            if (privateFile.exists() && publicFile.exists()) {
-                try {
-                    return new KeyPair(factory.generatePublic(new X509EncodedKeySpec(readFile(publicFile))),
-                            factory.generatePrivate(new PKCS8EncodedKeySpec(readFile(privateFile))));
-                } catch (GeneralSecurityException | IOException e) {
-                    // Corrupted file (the power went out mid-write): new key; the TV asks again.
-                    AppLog.w("ADB key unreadable, generating a new one");
-                }
-            }
+            // None yet, or a corrupted file (the power went out mid-write): new key; the TV asks again.
             KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
             generator.initialize(2048);
             KeyPair pair = generator.generateKeyPair();
@@ -240,6 +275,21 @@ final class Adb implements Closeable {
             return pair;
         } catch (GeneralSecurityException e) {
             throw new IOException("ADB key: " + e.getMessage());
+        }
+    }
+
+    /** The saved key, or null when there is none or it can't be read. */
+    private static synchronized KeyPair storedKeys(Context c) {
+        File dir = c.getFilesDir();
+        File privateFile = new File(dir, "adbkey"), publicFile = new File(dir, "adbkey.pub");
+        if (!privateFile.exists() || !publicFile.exists()) return null;
+        try {
+            KeyFactory factory = KeyFactory.getInstance("RSA");
+            return new KeyPair(factory.generatePublic(new X509EncodedKeySpec(readFile(publicFile))),
+                    factory.generatePrivate(new PKCS8EncodedKeySpec(readFile(privateFile))));
+        } catch (GeneralSecurityException | IOException e) {
+            AppLog.w("ADB key unreadable");
+            return null;
         }
     }
 

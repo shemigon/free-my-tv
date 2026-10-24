@@ -1,8 +1,9 @@
 /*
  * The home screen for web-app TVs (LG webOS, Samsung Tizen), with the Android app's design and behavior (HomeView):
  *  - top: the "For You" title and the tabs (Explore, Movies, Shows); icon-only glass buttons at the right (Live TV,
- *    HDMI Inputs, Settings) and the crypto quotes at the end of the tab row;
- *  - three picks for this hour in the selected tab; the background is the first one's photo, blurred and almost white;
+ *    HDMI Inputs, Settings), the time and the weather at their left, and the crypto quotes at the end of the tab row;
+ *  - this hour's picks in the selected tab, three in view and → for more; the background is the first one's photo,
+ *    blurred and almost white;
  *  - the glass shelf with the apps; ↓ opens the drawer (inputs, shortcuts, weather, prices); ↑ or Back closes it;
  *  - a night look from sunset to sunrise; a screensaver after a few idle minutes.
  * The remote's arrows, OK and Back move the focus; a pointer (LG's Magic Remote) focuses what it points at.
@@ -29,6 +30,7 @@
   }
 
   function coin(i, parent) {
+    if (i === 3) { el('span', 'pair', parent, Data.dollarPair()); return; }   // the dollar's price: "€/$", not Tether's logo
     var c = window.COINS && window.COINS[i];
     if (!c) return;
     var ns = 'http://www.w3.org/2000/svg';
@@ -278,7 +280,7 @@
   // MARK: - Focus
 
   var Z = {TOP: 'top', CARDS: 'cards', SHELF: 'shelf', DRAWER: 'drawer', APPS: 'apps', SETTINGS: 'settings', EDIT: 'edit', LANG: 'lang'};
-  var st = {zone: Z.SHELF, top: 0, tab: 0, card: 0, shelf: 0, drawer: 0, grid: 0, row: 0, edit: 0, lang: 0};
+  var st = {zone: Z.SHELF, top: 0, tab: 0, card: 0, first: 0, shelf: 0, drawer: 0, grid: 0, row: 0, edit: 0, lang: 0};
   var cards = [];
 
   function sheetOpen() { return st.zone === Z.APPS || st.zone === Z.SETTINGS || st.zone === Z.EDIT || st.zone === Z.LANG; }
@@ -293,8 +295,8 @@
     list = $('buttons').children;
     for (i = 0; i < list.length; i++) setClass(list[i], 'focus', st.zone === Z.TOP && st.top === 3 + i);
     setClass($('quotes'), 'hide', st.zone === Z.TOP && st.top >= 3);
-    list = $('cards').children;
-    for (i = 0; i < list.length; i++) setClass(list[i], 'focus', st.zone === Z.CARDS && st.card === i);
+    for (i = 0; i < tallNodes.length; i++) setClass(tallNodes[i].firstChild, 'focus', st.zone === Z.CARDS && st.card === i && i !== st.first);
+    for (i = 0; i < wideNodes.length; i++) setClass(wideNodes[i], 'focus', st.zone === Z.CARDS && st.card === st.first && i === wideFront);
     list = $('tiles').children;
     for (i = 0; i < list.length; i++) setClass(list[i], 'focus', st.zone === Z.SHELF && st.shelf === i);
     revealShelf();
@@ -372,30 +374,98 @@
 
   // MARK: - Picks and background
 
+  /*
+   * The picks: a row of up to ten with three in view, the first wide and two tall, as on Android (CardRow). → past the
+   * last one in view slides the row by one card, ← past the first slides it back, and the wide slot always holds the
+   * first card in view. Here the wide card is a pair of its own (crossfading when it changes) above the row of tall
+   * ones, which slides under it, with the next one peeking at the right edge: only transform and opacity move.
+   * Photos are set only on the cards in view and one at each side.
+   */
+  var VISIBLE = Data.VISIBLE, TALL_X = 1160, TALL_STEP = 360;
+  var tallNodes = [], wideNodes = [], wideFront = 0, wideKey = '';
+
   function renderCards() {
     var list = Data.picks(TAB_KIND[st.tab]);
     var holder = $('cards');
     setClass(body, 'no-picks', !list.length);
     var same = list.length === cards.length;
     for (var i = 0; same && i < list.length; i++) same = list[i].id === cards[i].id && list[i].backdrop === cards[i].backdrop && list[i].meta === cards[i].meta;
-    if (same && holder.children.length === list.length) return;
+    if (same && tallNodes.length === list.length && holder.children.length === (list.length ? list.length + 2 : 0)) return;
     cards = list;
     holder.innerHTML = '';
-    var rects = [[80, 1040], [1160, 320], [1520, 320]];
+    tallNodes = [];
+    wideNodes = [];
+    wideKey = '';
     for (var c = 0; c < list.length; c++) {
-      var p = list[c], card = el('div', 'card', holder);
-      card.style.left = rects[c][0] + 'px';
-      card.style.width = rects[c][1] + 'px';
-      var img = el('div', 'img', card);
-      img.style.backgroundImage = 'url(' + Data.image(p.backdrop, c === 0 ? 'w1280' : 'w780') + ')';
-      el('div', 'name', card, p.title);
-      if (c === 0 && p.meta) el('div', 'meta', card, p.meta);
+      var slot = el('div', 'slot', holder), card = el('div', 'card', slot);
+      el('div', 'img', card);
+      el('div', 'name', card, list[c].title);
       hover(card, Z.CARDS, c);
+      tallNodes.push(slot);
+    }
+    for (var w = 0; list.length && w < 2; w++) {
+      var wide = el('div', 'card wide', holder);
+      el('div', 'img', wide);
+      el('div', 'name', wide);
+      el('div', 'meta', wide);
+      hover(wide, Z.CARDS, -1);
+      wideNodes.push(wide);
     }
     st.card = Math.min(st.card, Math.max(0, list.length - 1));
+    st.first = Math.max(0, Math.min(st.first, list.length - VISIBLE));
     if (!list.length && st.zone === Z.CARDS) st.zone = Z.SHELF;
     backdrop(list.length ? Data.image(list[0].backdrop, 'w300') : '');
+    layoutCards();
     updateFocus();
+  }
+
+  /** Slides the row so the focused card is in view. */
+  function showCard() {
+    if (st.card < st.first) st.first = st.card;
+    else if (st.card >= st.first + VISIBLE) st.first = st.card - VISIBLE + 1;
+    layoutCards();
+  }
+
+  function layoutCards() {
+    for (var i = 0; i < tallNodes.length; i++) {
+      var s = i - st.first, slot = tallNodes[i];
+      slot.style.webkitTransform = slot.style.transform = 'translateX(' + (TALL_X + (s - 1) * TALL_STEP) + 'px)';
+      setClass(slot, 'under', s < 1);
+      setClass(slot, 'peek', s >= VISIBLE);
+      photo(slot.firstChild.firstChild, s >= -1 && s <= VISIBLE ? 'url(' + Data.image(cards[i].backdrop, 'w780') + ')' : '');
+    }
+    var p = cards[st.first];
+    if (!p || wideKey === p.id + p.backdrop + p.title + p.meta) return;
+    wideKey = p.id + p.backdrop + p.title + p.meta;
+    var old = wideNodes[wideFront];
+    wideFront = 1 - wideFront;
+    var front = wideNodes[wideFront];
+    // The tall photo (usually loaded already) under the sharper wide one while that loads.
+    photo(front.firstChild, 'url(' + Data.image(p.backdrop, 'w1280') + '), url(' + Data.image(p.backdrop, 'w780') + ')');
+    front.childNodes[1].textContent = p.title;
+    front.childNodes[2].textContent = p.meta || '';
+    setClass(front, 'shown', true);
+    setClass(old, 'shown', false);
+    setClass(old, 'focus', false);
+    setTimeout(function () { if (old !== wideNodes[wideFront]) photo(old.firstChild, ''); }, 400);
+  }
+
+  /** Sets a card's background-image ('' for none) only when it changes. */
+  function photo(node, image) {
+    if (node.getAttribute('data-image') === image) return;
+    node.setAttribute('data-image', image);
+    node.style.backgroundImage = image;
+  }
+
+  /** The cards in view, from the wide one. */
+  function cardsInView() {
+    var out = [];
+    for (var i = st.first; i < Math.min(cards.length, st.first + VISIBLE); i++) out.push(cardNode(i));
+    return out;
+  }
+
+  function cardNode(i) {
+    return i === st.first ? wideNodes[wideFront] : tallNodes[i] && tallNodes[i].firstChild;
   }
 
   var bgUrl = null, bgFront = 'bgA';
@@ -423,9 +493,19 @@
   }
 
   function renderClock() {
-    var d = new Date(), c = $('clock');
-    c.firstChild.textContent = formatDate('format|h:mm', d.getTime());
-    c.lastChild.textContent = formatDate('format|EEEE, MMMM d', d.getTime());
+    var at = Date.now(), c = $('clock'), time = formatDate('format|h:mm', at);
+    c.firstChild.textContent = time;
+    c.lastChild.textContent = formatDate('format|EEEE, MMMM d', at);
+    $('topclock').firstChild.textContent = time;
+  }
+
+  /** The weather symbol and temperature beside the time at the top, with the widget on and a forecast. */
+  function renderTopWeather() {
+    var box = $('topclock').lastChild, w = Data.weather;
+    box.innerHTML = '';
+    if (!Prefs.weather() || !w || isNaN(w.temp)) return;
+    sym(Data.symbol(w.code, w.isDay), box);
+    box.appendChild(document.createTextNode(Data.degrees(w.temp)));
   }
 
   /** On the minute, so the clock never runs late (the 30-second refresh could, by up to 30 s). */
@@ -538,6 +618,7 @@
   }
 
   function renderPanels() {
+    renderTopWeather();
     var d = $('drawer');
     var old = d.querySelectorAll('.panel');
     for (var o = 0; o < old.length; o++) d.removeChild(old[o]);
@@ -655,7 +736,7 @@
   // MARK: - Home Settings
 
   function settingRows() {
-    var unit = Prefs.temperature(), theme = Prefs.theme();
+    var unit = Prefs.temperature(), theme = Prefs.theme(), clock = Prefs.clock();
     var auto = tr('Automatic'), picked = pickedLanguage();
     var rows = [
       {label: tr('Language'), value: picked === 'auto' ? auto : I18N.languageName(picked), opens: true, language: true,
@@ -667,10 +748,12 @@
       {label: tr('Weather widget'), toggle: Prefs.weather(),
         step: function () { Prefs.set('weather', !Prefs.weather()); renderPanels(); }},
       {label: tr('Quotes widget'), toggle: Prefs.quotes(),
-        step: function () { Prefs.set('quotes', !Prefs.quotes()); Data.settingsChanged(); }}
+        step: function () { Prefs.set('quotes', !Prefs.quotes()); Data.settingsChanged(); }},
+      {label: tr('Clock'), value: clock === '12' ? tr('12-hour') : clock === '24' ? tr('24-hour') : auto,
+        step: function (d) { cycle('clock', ['auto', '12', '24'], clock, d); I18N.setClock(Prefs.clock()); renderAll(); }}
     ];
     var names = ['Bitcoin', 'Ethereum', 'Solana', tr('Dollar')];
-    var count = Data.currency === 'BRL' ? 4 : 3;
+    var count = Data.dollarRow() ? 4 : 3;
     for (var i = 0; i < count; i++) {
       (function (i) {
         rows.push({label: names[i], toggle: Prefs.quotes() && Prefs.coin(i), dim: !Prefs.quotes(),
@@ -890,31 +973,32 @@
   function selectTab(i) {
     if (i === st.tab) return;
     st.tab = i;
+    st.card = st.first = 0;
     renderCards();
   }
 
   function move(dx, dy) {
-    var tiles = $('tiles').children, cardNodes = $('cards').children;
+    var tiles = $('tiles').children;
     switch (st.zone) {
       case Z.SHELF:
         if (dx) st.shelf = Math.max(0, Math.min(shelf.length - 1, st.shelf + dx));
         else if (dy > 0) { openDrawer(); return; }
         else if (dy < 0) {
-          if (cards.length) { st.zone = Z.CARDS; st.card = nearest(cardNodes, centerX(tiles[st.shelf])); }
+          if (cards.length) { st.zone = Z.CARDS; st.card = st.first + nearest(cardsInView(), centerX(tiles[st.shelf])); }
           else { st.zone = Z.TOP; st.top = st.tab; }
         }
         break;
       case Z.CARDS:
-        if (dx) st.card = Math.max(0, Math.min(cards.length - 1, st.card + dx));
+        if (dx) { st.card = Math.max(0, Math.min(cards.length - 1, st.card + dx)); showCard(); }
         else if (dy < 0) { st.zone = Z.TOP; st.top = st.tab; }
-        else if (shelf.length) { st.zone = Z.SHELF; st.shelf = nearest(tiles, centerX(cardNodes[st.card])); }
+        else if (shelf.length) { st.zone = Z.SHELF; st.shelf = nearest(tiles, centerX(cardNode(st.card))); }
         break;
       case Z.TOP:
         if (dx) {
           st.top = Math.max(0, Math.min(5, st.top + dx));
           if (st.top < 3) selectTab(st.top);   // as on Apple TV: focusing a tab selects it
         } else if (dy > 0) {
-          if (cards.length) { st.zone = Z.CARDS; st.card = Math.min(cards.length - 1, st.top < 3 ? 0 : cards.length - 1); }
+          if (cards.length) { st.zone = Z.CARDS; st.card = st.top < 3 ? st.first : Math.min(cards.length - 1, st.first + VISIBLE - 1); }
           else st.zone = Z.SHELF;
         }
         break;
@@ -962,7 +1046,7 @@
       if (zone === Z.SHELF && st.zone === Z.DRAWER) closeDrawer();
       st.zone = zone;
       if (zone === Z.TOP) { st.top = index; if (index < 3) selectTab(index); }
-      else if (zone === Z.CARDS) st.card = index;
+      else if (zone === Z.CARDS) { st.card = index < 0 ? st.first : index; showCard(); }
       else if (zone === Z.SHELF) st.shelf = index;
       else if (zone === Z.DRAWER) st.drawer = index;
       else if (zone === Z.APPS) st.grid = index;
@@ -1114,7 +1198,8 @@
     closeSheets();
     st.zone = Z.SHELF;
     st.shelf = 0;
-    if (st.tab !== 0) { st.tab = 0; renderCards(); }
+    if (st.tab !== 0) selectTab(0);
+    else if (st.first) { st.card = st.first = 0; layoutCards(); }
     updateFocus();
   }
 
@@ -1142,6 +1227,7 @@
   });
 
   I18N.set(Prefs.language());
+  I18N.setClock(Prefs.clock());
   checkNight();   // now, from the last forecast: not after the TV lists its apps, with the day look until then
   // LG's screensaver waits only when ours will show: not under a sheet (ours waits there), and not without photos.
   TV.holdScreenSaver(function () { return !sheetOpen() && saverPhotos().length > 0; });

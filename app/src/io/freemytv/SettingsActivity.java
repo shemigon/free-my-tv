@@ -659,15 +659,15 @@ public class SettingsActivity extends Activity {
 
         // MARK: - Home Settings and Remote Buttons
 
-        private static final String[] UNITS = {"auto", "C", "F"}, THEMES = {"auto", "light", "dark"};
-        /** Home Settings: language, temperature, theme, my photos, sounds, weather, city, quotes, then one row per coin. */
-        private static final int PHOTOS_ROW = 3, CITY_ROW = 6, COIN_ROWS = 8;
+        private static final String[] UNITS = {"auto", "C", "F"}, THEMES = {"auto", "light", "dark"}, CLOCKS = {"auto", "12", "24"};
+        /**
+         * Home Settings: language, temperature, theme, my photos, sounds, weather, city, quotes, on TCL the TV's power
+         * (TvPower), then one row per coin.
+         */
+        private static final int PHOTOS_ROW = 3, CITY_ROW = 6, CLOCK_ROW = 8, OFF_ROW = 9, SCREEN_ROW = 10, VOLUME_ROW = 11;
+        private static final int COIN_ROWS = TvPower.supported() ? 12 : 9;
         /** Home Settings rows on screen at once (what fits above the hints at 1080p); a longer list scrolls. */
         private static final int SETTINGS_VISIBLE = 10;
-
-        private boolean dollar() {
-            return "BRL".equalsIgnoreCase(Config.CURRENCY.trim());
-        }
 
         private String[] settingLabels() {
             List<String> l = new ArrayList<>();
@@ -679,10 +679,16 @@ public class SettingsActivity extends Activity {
             l.add(Ui.tr("Weather widget"));
             l.add(Ui.tr("City"));
             l.add(Ui.tr("Quotes widget"));
+            l.add(Ui.tr("Clock"));
+            if (TvPower.supported()) {
+                l.add(Ui.tr("Turn off with the device"));
+                l.add(Ui.tr("Turn-on screen"));
+                l.add(Ui.tr("Volume when turned on"));
+            }
             l.add("Bitcoin");
             l.add("Ethereum");
             l.add("Solana");
-            if (dollar()) l.add(Ui.tr("Dollar"));
+            if (HomeData.dollarRow()) l.add(Ui.tr("Dollar"));
             return l.toArray(new String[0]);
         }
 
@@ -702,6 +708,13 @@ public class SettingsActivity extends Activity {
             v[5] = onOff(Prefs.weather());
             v[CITY_ROW] = !cityStatus.isEmpty() ? cityStatus : Prefs.city().isEmpty() ? "—" : Prefs.city();
             v[7] = onOff(Prefs.quotes());
+            String clock = Prefs.clock();
+            v[CLOCK_ROW] = clock.equals("12") ? Ui.tr("12-hour") : clock.equals("24") ? Ui.tr("24-hour") : Ui.tr("Automatic");
+            if (TvPower.supported()) {
+                v[OFF_ROW] = onOff(Prefs.offWithDevice());
+                v[SCREEN_ROW] = Prefs.turnOnScreen() ? Ui.tr("Home or device") : Ui.tr("TV default");
+                v[VOLUME_ROW] = Prefs.startVolume() == 0 ? Ui.tr("Off") : String.valueOf(Prefs.startVolume());
+            }
             // No quotes widget, nowhere to show prices: the coins read as off (and stay locked) until it is back on.
             for (int i = COIN_ROWS; i < v.length; i++) v[i] = onOff(Prefs.quotes() && Prefs.coin(i - COIN_ROWS));
             return v;
@@ -795,12 +808,28 @@ public class SettingsActivity extends Activity {
                 case 5: Prefs.setWeather(!Prefs.weather()); break;
                 case CITY_ROW: return;
                 case 7: Prefs.setQuotes(!Prefs.quotes()); break;
+                case CLOCK_ROW: {
+                    int at = java.util.Arrays.asList(CLOCKS).indexOf(Prefs.clock());
+                    Prefs.setClock(CLOCKS[(at + dir + CLOCKS.length) % CLOCKS.length]);
+                    break;
+                }
                 default:
+                    if (row < COIN_ROWS) {
+                        adjustPower(row, dir);
+                        return;
+                    }
                     if (!Prefs.quotes()) return;
                     Prefs.setCoin(row - COIN_ROWS, !Prefs.coin(row - COIN_ROWS));
                     break;
             }
             HomeData.get(getContext()).settingsChanged();
+        }
+
+        /** The TV power rows (TCL): saved for TvPower, nothing for the home screen to fetch again. */
+        private void adjustPower(int row, int dir) {
+            if (row == OFF_ROW) Prefs.setOffWithDevice(!Prefs.offWithDevice());
+            else if (row == SCREEN_ROW) Prefs.setTurnOnScreen(!Prefs.turnOnScreen());
+            else if (row == VOLUME_ROW) Prefs.setStartVolume(Prefs.startVolume() + dir);   // Off ← stays Off: never wraps to 100
         }
 
         private void askCity() {

@@ -385,10 +385,13 @@ final class HomeApps {
                 custom = info.loadCustomLabel(c);
             } catch (RuntimeException ignored) {
             }
-            String reported = devices.containsKey(info.getId()) ? devices.get(info.getId()) : "";
+            // A device in standby keeps its name: its CEC input stays while it rests (a PS5's port goes to standby, an
+            // Apple TV's doesn't).
+            String reported = devices.containsKey(info.getId()) && state != TvInputManager.INPUT_STATE_DISCONNECTED
+                    ? devices.get(info.getId()) : "";
             String label = custom != null && custom.length() > 0 ? custom.toString()
-                    : !reported.isEmpty() && state == TvInputManager.INPUT_STATE_CONNECTED ? reported : "HDMI " + number;
-            String symbol = state == TvInputManager.INPUT_STATE_CONNECTED || custom != null
+                    : !reported.isEmpty() ? reported : "HDMI " + number;
+            String symbol = state == TvInputManager.INPUT_STATE_CONNECTED || custom != null || !reported.isEmpty()
                     ? deviceSymbol(label) : "hdmi";
             Item it = shortcut(INPUT, "hdmi" + number, label, symbol);
             it.inputId = info.getId();

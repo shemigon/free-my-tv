@@ -18,8 +18,8 @@ import android.graphics.Shader;
  *  - the Liquid Glass version (480×270, lightly blurred): the photo shows through the shelf and the cards;
  *  - with forLight: the cards (the photo without scrims, cropped wide and tall, already at the focused card size) and
  *    the frosted and glass versions blended with white (by day) and with near-black (at night).
- * Only what is needed gets built (with forLight, no full photo: the cards are lightweight, so all 9 for the three tabs
- * fit in memory, ready); the other fields stay null.
+ * Only what is needed gets built (with forLight, no full photo: the cards are lightweight, so those in view on all three
+ * tabs fit in memory, ready); the other fields stay null.
  * The final image lives only in GPU memory (HARDWARE): drawing it costs one texture, and the process doesn't hold 8 MB.
  */
 final class Backdrop {
